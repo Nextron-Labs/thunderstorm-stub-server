@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show:*)",
+      "Bash(pip3 show:*)",
+      "Bash(python3:*)",
+      "Bash(flask:*)",
+      "Bash(/opt/homebrew/bin/python3.9:*)",
+      "Read(//Users/neo/nextcloud/Nextron/Manuals/THOR/thor-manual/**)",
+      "Bash(grep:*)",
+      "Bash(printf:*)",
+      "Bash(go build:*)",
+      "Bash(go test:*)"
+    ]
+  }
+}

@@ -144,14 +144,15 @@ type logMeta struct {
 }
 
 type logSubject struct {
-	Type       string        `json:"type"`
-	Path       string        `json:"path"`
-	Exists     string        `json:"exists"`
-	Extension  string        `json:"extension"`
-	Hashes     logHashes     `json:"hashes"`
-	FirstBytes logFirstBytes `json:"first_bytes"`
-	Size       int           `json:"size"`
-	Source     string        `json:"source"`
+	Type           string        `json:"type"`
+	Path           string        `json:"path"`
+	ClientFilename string        `json:"client_filename,omitempty"`
+	Exists         string        `json:"exists"`
+	Extension      string        `json:"extension"`
+	Hashes         logHashes     `json:"hashes"`
+	FirstBytes     logFirstBytes `json:"first_bytes"`
+	Size           int           `json:"size"`
+	Source         string        `json:"source"`
 }
 
 type logHashes struct {
@@ -275,6 +276,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("/api/getAsyncResults", s.handleGetAsyncResults)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/info", s.handleInfo)
+	mux.HandleFunc("/api/collection", s.handleCollection)
 	return mux
 }
 
@@ -429,6 +431,40 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"stub_mode":     s.scanner.IsStub(),
 		"rules_dir":     s.cfg.RulesDir,
 	})
+}
+
+// handleCollection handles POST /api/collection — collection begin/end markers.
+// On a "begin" request it generates a scan_id and returns it; on "end" it logs stats.
+// This endpoint is optional and forward-compatible: collectors silently ignore 404.
+func (s *Server) handleCollection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	markerType, _ := req["type"].(string)
+	source, _ := req["source"].(string)
+	collector, _ := req["collector"].(string)
+
+	switch markerType {
+	case "begin":
+		scanID := fmt.Sprintf("%s", newUUID())
+		logStd.Printf("[INFO] Collection begin: source=%s collector=%s scan_id=%s", source, collector, scanID)
+		s.writeJSON(w, map[string]interface{}{"scan_id": scanID})
+	case "end":
+		scanID, _ := req["scan_id"].(string)
+		stats, _ := req["stats"].(map[string]interface{})
+		logStd.Printf("[INFO] Collection end: source=%s collector=%s scan_id=%s stats=%v", source, collector, scanID, stats)
+		s.writeJSON(w, map[string]interface{}{"ok": true})
+	default:
+		http.Error(w, "unknown marker type", http.StatusBadRequest)
+	}
 }
 
 // ── Core scan logic ───────────────────────────────────────────────────────────
@@ -597,10 +633,11 @@ func (s *Server) doScan(scanID string, data []byte, clientPath, source string) (
 		},
 		Message: message,
 		Subject: logSubject{
-			Type:      "file",
-			Path:      storedPath,
-			Exists:    "yes",
-			Extension: ext,
+			Type:           "file",
+			Path:           storedPath,
+			ClientFilename: clientPath,
+			Exists:         "yes",
+			Extension:      ext,
 			Hashes: logHashes{
 				SHA256: hashes.SHA256,
 				SHA1:   hashes.SHA1,
@@ -763,10 +800,11 @@ func buildErrorLogEntry(scanID, hostname, clientPath, source, ext string, hashes
 		},
 		Message: "Scan error",
 		Subject: logSubject{
-			Type:      "file",
-			Path:      clientPath,
-			Exists:    "yes",
-			Extension: ext,
+			Type:           "file",
+			Path:           clientPath,
+			ClientFilename: clientPath,
+			Exists:         "yes",
+			Extension:      ext,
 			Hashes: logHashes{
 				SHA256: hashes.SHA256,
 				SHA1:   hashes.SHA1,

@@ -1,15 +1,23 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,9 +42,13 @@ type Config struct {
 	RulesDir      string
 	LogFile       string
 	UploadsDir    string
-	MaxConcurrent int // max simultaneous synchronous scans
-	QueueMaxSize  int // max pending async jobs before 503
-	RetryAfter    int // value of Retry-After header on 503 responses (seconds)
+	MaxConcurrent int    // max simultaneous synchronous scans
+	QueueMaxSize  int    // max pending async jobs before 503
+	RetryAfter    int    // value of Retry-After header on 503 responses (seconds)
+	TLSCert       string // path to TLS certificate file (PEM)
+	TLSKey        string // path to TLS private key file (PEM)
+	TLSGenerate   bool   // auto-generate self-signed cert if no cert/key provided
+	Strict        bool   // strict validation mode: reject requests with missing/null required fields
 }
 
 func configFromFlags() Config {
@@ -48,6 +60,10 @@ func configFromFlags() Config {
 	flag.IntVar(&c.MaxConcurrent, "max-concurrent", envInt("MAX_CONCURRENT", 4), "Max simultaneous sync scans")
 	flag.IntVar(&c.QueueMaxSize, "queue-max-size", envInt("QUEUE_MAX_SIZE", 100), "Max queued async jobs")
 	flag.IntVar(&c.RetryAfter, "retry-after", envInt("RETRY_AFTER", 30), "Retry-After seconds sent with 503")
+	flag.StringVar(&c.TLSCert, "tls-cert", envStr("TLS_CERT", ""), "Path to TLS certificate PEM file")
+	flag.StringVar(&c.TLSKey, "tls-key", envStr("TLS_KEY", ""), "Path to TLS private key PEM file")
+	flag.BoolVar(&c.TLSGenerate, "tls-generate", false, "Auto-generate self-signed certificate (ignores -tls-cert/-tls-key)")
+	flag.BoolVar(&c.Strict, "strict", false, "Strict validation: reject requests with missing/null required fields")
 	flag.Parse()
 	return c
 }
@@ -433,6 +449,18 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// collectionMarkerLog is the structure written to the JSONL audit log for collection markers.
+type collectionMarkerLog struct {
+	Type      string      `json:"type"`
+	Marker    string      `json:"marker"`
+	Source    interface{} `json:"source"`
+	Collector interface{} `json:"collector"`
+	ScanID    string      `json:"scan_id,omitempty"`
+	Timestamp interface{} `json:"timestamp,omitempty"`
+	Stats     interface{} `json:"stats,omitempty"`
+	Time      string      `json:"time"`
+}
+
 // handleCollection handles POST /api/collection — collection begin/end markers.
 // On a "begin" request it generates a scan_id and returns it; on "end" it logs stats.
 // This endpoint is optional and forward-compatible: collectors silently ignore 404.
@@ -452,15 +480,68 @@ func (s *Server) handleCollection(w http.ResponseWriter, r *http.Request) {
 	source, _ := req["source"].(string)
 	collector, _ := req["collector"].(string)
 
+	// Strict validation: reject markers with missing/empty required fields
+	if s.cfg.Strict {
+		var problems []string
+		if markerType == "" {
+			problems = append(problems, "missing or empty 'type'")
+		}
+		// Check for null source (the raw JSON value, not just empty string)
+		if rawSource, exists := req["source"]; !exists || rawSource == nil {
+			problems = append(problems, "'source' is missing or null")
+		} else if source == "" {
+			problems = append(problems, "'source' is empty string")
+		}
+		if rawCollector, exists := req["collector"]; !exists || rawCollector == nil {
+			problems = append(problems, "'collector' is missing or null")
+		} else if collector == "" {
+			problems = append(problems, "'collector' is empty string")
+		}
+		if _, exists := req["timestamp"]; !exists {
+			problems = append(problems, "missing 'timestamp'")
+		}
+		if len(problems) > 0 {
+			msg := fmt.Sprintf("strict validation failed: %s", strings.Join(problems, "; "))
+			logStd.Printf("[WARN] Collection marker rejected: %s", msg)
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+	}
+
 	switch markerType {
 	case "begin":
 		scanID := fmt.Sprintf("%s", newUUID())
 		logStd.Printf("[INFO] Collection begin: source=%s collector=%s scan_id=%s", source, collector, scanID)
+
+		// Write to JSONL audit log
+		s.writeLogEntry(collectionMarkerLog{
+			Type:      "collection_marker",
+			Marker:    "begin",
+			Source:    req["source"],
+			Collector: req["collector"],
+			ScanID:    scanID,
+			Timestamp: req["timestamp"],
+			Time:      time.Now().UTC().Format(time.RFC3339),
+		})
+
 		s.writeJSON(w, map[string]interface{}{"scan_id": scanID})
 	case "end":
 		scanID, _ := req["scan_id"].(string)
 		stats, _ := req["stats"].(map[string]interface{})
 		logStd.Printf("[INFO] Collection end: source=%s collector=%s scan_id=%s stats=%v", source, collector, scanID, stats)
+
+		// Write to JSONL audit log
+		s.writeLogEntry(collectionMarkerLog{
+			Type:      "collection_marker",
+			Marker:    "end",
+			Source:    req["source"],
+			Collector: req["collector"],
+			ScanID:    scanID,
+			Timestamp: req["timestamp"],
+			Stats:     stats,
+			Time:      time.Now().UTC().Format(time.RFC3339),
+		})
+
 		s.writeJSON(w, map[string]interface{}{"ok": true})
 	default:
 		http.Error(w, "unknown marker type", http.StatusBadRequest)
@@ -710,6 +791,17 @@ func (s *Server) extractUpload(r *http.Request) (data []byte, clientPath, source
 	}
 
 	source = r.URL.Query().Get("source")
+
+	// In strict mode, validate required upload fields
+	if s.cfg.Strict {
+		if source == "" {
+			return nil, "", "", fmt.Errorf("strict validation: missing 'source' query parameter")
+		}
+		if header.Filename == "" {
+			return nil, "", "", fmt.Errorf("strict validation: missing filename in multipart upload")
+		}
+	}
+
 	return data, header.Filename, source, nil
 }
 
@@ -856,6 +948,49 @@ func newUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
+// ── TLS helpers ───────────────────────────────────────────────────────────────
+
+// generateSelfSignedCert creates an in-memory self-signed TLS certificate
+// valid for localhost, 127.0.0.1, ::1, and all local network IPs.
+func generateSelfSignedCert() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("generate key: %w", err)
+	}
+
+	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "thunderstorm-stub"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost", "thunderstorm-stub"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+
+	// Add all local interface IPs as SANs so collectors on the same network can connect.
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok {
+				tmpl.IPAddresses = append(tmpl.IPAddresses, ipnet.IP)
+			}
+		}
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("create cert: %w", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 func main() {
@@ -872,12 +1007,42 @@ func main() {
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
-	logStd.Printf("[INFO] Thunderstorm stub server listening on %s (stub_mode=%v)", addr, sc.IsStub())
 	if cfg.LogFile != "" {
 		logStd.Printf("[INFO] JSONL log → %s", cfg.LogFile)
 	}
 
-	if err := http.ListenAndServe(addr, srv); err != nil {
-		logStd.Fatalf("[FATAL] ListenAndServe: %v", err)
+	useTLS := cfg.TLSGenerate || (cfg.TLSCert != "" && cfg.TLSKey != "")
+
+	if useTLS {
+		var tlsCert tls.Certificate
+		if cfg.TLSGenerate {
+			logStd.Printf("[INFO] Generating self-signed TLS certificate")
+			tlsCert, err = generateSelfSignedCert()
+			if err != nil {
+				logStd.Fatalf("[FATAL] Generate TLS cert: %v", err)
+			}
+		} else {
+			tlsCert, err = tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+			if err != nil {
+				logStd.Fatalf("[FATAL] Load TLS cert/key: %v", err)
+			}
+		}
+
+		tlsServer := &http.Server{
+			Addr:    addr,
+			Handler: srv,
+			TLSConfig: &tls.Config{
+				Certificates: []tls.Certificate{tlsCert},
+			},
+		}
+		logStd.Printf("[INFO] Thunderstorm stub server listening on %s (TLS=true, stub_mode=%v)", addr, sc.IsStub())
+		if err := tlsServer.ListenAndServeTLS("", ""); err != nil {
+			logStd.Fatalf("[FATAL] ListenAndServeTLS: %v", err)
+		}
+	} else {
+		logStd.Printf("[INFO] Thunderstorm stub server listening on %s (stub_mode=%v)", addr, sc.IsStub())
+		if err := http.ListenAndServe(addr, srv); err != nil {
+			logStd.Fatalf("[FATAL] ListenAndServe: %v", err)
+		}
 	}
 }

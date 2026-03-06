@@ -211,6 +211,22 @@ type logData struct {
 	Encoding string `json:"encoding"`
 }
 
+// ── Test control types ────────────────────────────────────────────────────────
+
+// UploadRule configures a programmable response for uploads matching certain criteria.
+type UploadRule struct {
+	MatchFilename string `json:"match_filename,omitempty"` // exact filename match
+	MatchCount    []int  `json:"match_count,omitempty"`    // match Nth upload (1-based)
+	Status        int    `json:"status"`                   // HTTP status to return
+	Body          string `json:"body,omitempty"`           // response body
+	Default       bool   `json:"default,omitempty"`        // catch-all rule
+}
+
+// TestConfig holds programmable response rules set via /api/test/config.
+type TestConfig struct {
+	UploadRules []UploadRule `json:"upload_rules"`
+}
+
 // ── Server ────────────────────────────────────────────────────────────────────
 
 // Server holds all runtime state and implements http.Handler via its Mux.
@@ -238,6 +254,11 @@ type Server struct {
 
 	logMu   sync.Mutex
 	logFile *os.File // nil when no log file is configured
+
+	// Test control state
+	testMu       sync.Mutex
+	testConfig   TestConfig
+	uploadCount  int // total uploads since last reset (for match_count rules)
 }
 
 // newServer constructs and wires up a Server. It starts the background async
@@ -293,6 +314,9 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/info", s.handleInfo)
 	mux.HandleFunc("/api/collection", s.handleCollection)
+	mux.HandleFunc("/api/test/reset", s.handleTestReset)
+	mux.HandleFunc("/api/test/config", s.handleTestConfig)
+	mux.HandleFunc("/api/test/log", s.handleTestLog)
 	return mux
 }
 
@@ -321,6 +345,23 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for programmable test response rules
+	if ruleStatus, ruleBody := s.matchUploadRule(clientPath); ruleStatus != 0 {
+		if ruleStatus == 503 {
+			s.respond503(w)
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(ruleStatus)
+			if ruleBody != "" {
+				_, _ = w.Write([]byte(ruleBody))
+			}
+		}
+		// Still log the upload attempt for test verification
+		scanID := newUUID()
+		_, _ = s.doScan(scanID, data, clientPath, source)
+		return
+	}
+
 	scanID := newUUID()
 	results, err := s.doScan(scanID, data, clientPath, source)
 	if err != nil {
@@ -342,6 +383,23 @@ func (s *Server) handleCheckAsync(w http.ResponseWriter, r *http.Request) {
 	data, clientPath, source, err := s.extractUpload(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Check for programmable test response rules (same as handleCheck)
+	if ruleStatus, ruleBody := s.matchUploadRule(clientPath); ruleStatus != 0 {
+		if ruleStatus == 503 {
+			s.respond503(w)
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(ruleStatus)
+			if ruleBody != "" {
+				_, _ = w.Write([]byte(ruleBody))
+			}
+		}
+		// Still log the upload attempt for test verification
+		scanID := newUUID()
+		_, _ = s.doScan(scanID, data, clientPath, source)
 		return
 	}
 
@@ -546,6 +604,120 @@ func (s *Server) handleCollection(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown marker type", http.StatusBadRequest)
 	}
+}
+
+// ── Test control handlers ─────────────────────────────────────────────────────
+
+// handleTestReset clears the JSONL log, resets upload count and response config.
+func (s *Server) handleTestReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.testMu.Lock()
+	s.testConfig = TestConfig{}
+	s.uploadCount = 0
+	s.testMu.Unlock()
+
+	// Truncate the log file
+	s.logMu.Lock()
+	if s.logFile != nil {
+		_ = s.logFile.Truncate(0)
+		_, _ = s.logFile.Seek(0, 0)
+	}
+	s.logMu.Unlock()
+
+	s.writeJSON(w, map[string]interface{}{"ok": true})
+}
+
+// handleTestConfig sets programmable response rules for uploads.
+func (s *Server) handleTestConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var tc TestConfig
+	if err := json.NewDecoder(r.Body).Decode(&tc); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.testMu.Lock()
+	s.testConfig = tc
+	s.testMu.Unlock()
+
+	s.writeJSON(w, map[string]interface{}{"ok": true})
+}
+
+// handleTestLog returns the current JSONL log contents.
+func (s *Server) handleTestLog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+
+	if s.logFile == nil {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Read the file from the beginning
+	name := s.logFile.Name()
+	data, err := os.ReadFile(name)
+	if err != nil {
+		http.Error(w, "read log: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// matchUploadRule checks if any test rule matches the current upload and returns
+// the overridden status code and body. Returns (0, "") if no rule matches (use default behavior).
+func (s *Server) matchUploadRule(clientPath string) (int, string) {
+	s.testMu.Lock()
+	s.uploadCount++
+	count := s.uploadCount
+	rules := s.testConfig.UploadRules
+	s.testMu.Unlock()
+
+	if len(rules) == 0 {
+		return 0, ""
+	}
+
+	filename := filepath.Base(clientPath)
+	var defaultRule *UploadRule
+
+	for i := range rules {
+		rule := &rules[i]
+		if rule.Default {
+			defaultRule = rule
+			continue
+		}
+		if rule.MatchFilename != "" && rule.MatchFilename == filename {
+			return rule.Status, rule.Body
+		}
+		if len(rule.MatchCount) > 0 {
+			for _, n := range rule.MatchCount {
+				if n == count {
+					return rule.Status, rule.Body
+				}
+			}
+		}
+	}
+
+	if defaultRule != nil {
+		return defaultRule.Status, defaultRule.Body
+	}
+	return 0, ""
 }
 
 // ── Core scan logic ───────────────────────────────────────────────────────────

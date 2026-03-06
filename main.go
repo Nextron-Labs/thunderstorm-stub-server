@@ -516,6 +516,7 @@ type collectionMarkerLog struct {
 	ScanID    string      `json:"scan_id,omitempty"`
 	Timestamp interface{} `json:"timestamp,omitempty"`
 	Stats     interface{} `json:"stats,omitempty"`
+	Reason    string      `json:"reason,omitempty"`
 	Time      string      `json:"time"`
 }
 
@@ -597,6 +598,25 @@ func (s *Server) handleCollection(w http.ResponseWriter, r *http.Request) {
 			ScanID:    scanID,
 			Timestamp: req["timestamp"],
 			Stats:     stats,
+			Time:      time.Now().UTC().Format(time.RFC3339),
+		})
+
+		s.writeJSON(w, map[string]interface{}{"ok": true})
+	case "interrupted":
+		scanID, _ := req["scan_id"].(string)
+		stats, _ := req["stats"].(map[string]interface{})
+		reason, _ := req["reason"].(string)
+		logStd.Printf("[WARN] Collection interrupted: source=%s collector=%s scan_id=%s reason=%s stats=%v", source, collector, scanID, reason, stats)
+
+		s.writeLogEntry(collectionMarkerLog{
+			Type:      "collection_marker",
+			Marker:    "interrupted",
+			Source:    req["source"],
+			Collector: req["collector"],
+			ScanID:    scanID,
+			Timestamp: req["timestamp"],
+			Stats:     stats,
+			Reason:    reason,
 			Time:      time.Now().UTC().Format(time.RFC3339),
 		})
 

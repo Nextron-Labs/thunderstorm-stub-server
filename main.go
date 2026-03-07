@@ -215,11 +215,12 @@ type logData struct {
 
 // UploadRule configures a programmable response for uploads matching certain criteria.
 type UploadRule struct {
-	MatchFilename string `json:"match_filename,omitempty"` // exact filename match
-	MatchCount    []int  `json:"match_count,omitempty"`    // match Nth upload (1-based)
-	Status        int    `json:"status"`                   // HTTP status to return
-	Body          string `json:"body,omitempty"`           // response body
-	Default       bool   `json:"default,omitempty"`        // catch-all rule
+	MatchFilename string            `json:"match_filename,omitempty"` // exact filename match
+	MatchCount    []int             `json:"match_count,omitempty"`    // match Nth upload (1-based)
+	Status        int               `json:"status"`                  // HTTP status to return
+	Body          string            `json:"body,omitempty"`          // response body
+	Headers       map[string]string `json:"headers,omitempty"`       // custom response headers
+	Default       bool              `json:"default,omitempty"`       // catch-all rule
 }
 
 // TestConfig holds programmable response rules set via /api/test/config.
@@ -335,7 +336,7 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	default:
-		s.respond503(w)
+		s.respond503(w, nil)
 		return
 	}
 
@@ -346,14 +347,17 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check for programmable test response rules
-	if ruleStatus, ruleBody := s.matchUploadRule(clientPath); ruleStatus != 0 {
-		if ruleStatus == 503 {
-			s.respond503(w)
+	if rule := s.matchUploadRule(clientPath); rule != nil {
+		if rule.Status == 503 {
+			s.respond503(w, rule.Headers)
 		} else {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(ruleStatus)
-			if ruleBody != "" {
-				_, _ = w.Write([]byte(ruleBody))
+			for k, v := range rule.Headers {
+				w.Header().Set(k, v)
+			}
+			w.WriteHeader(rule.Status)
+			if rule.Body != "" {
+				_, _ = w.Write([]byte(rule.Body))
 			}
 		}
 		// Still log the upload attempt for test verification
@@ -387,14 +391,17 @@ func (s *Server) handleCheckAsync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check for programmable test response rules (same as handleCheck)
-	if ruleStatus, ruleBody := s.matchUploadRule(clientPath); ruleStatus != 0 {
-		if ruleStatus == 503 {
-			s.respond503(w)
+	if rule := s.matchUploadRule(clientPath); rule != nil {
+		if rule.Status == 503 {
+			s.respond503(w, rule.Headers)
 		} else {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(ruleStatus)
-			if ruleBody != "" {
-				_, _ = w.Write([]byte(ruleBody))
+			for k, v := range rule.Headers {
+				w.Header().Set(k, v)
+			}
+			w.WriteHeader(rule.Status)
+			if rule.Body != "" {
+				_, _ = w.Write([]byte(rule.Body))
 			}
 		}
 		// Still log the upload attempt for test verification
@@ -420,7 +427,7 @@ func (s *Server) handleCheckAsync(w http.ResponseWriter, r *http.Request) {
 		s.jobsMu.Lock()
 		delete(s.jobs, jobID)
 		s.jobsMu.Unlock()
-		s.respond503(w)
+		s.respond503(w, nil)
 		return
 	}
 
@@ -700,9 +707,9 @@ func (s *Server) handleTestLog(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-// matchUploadRule checks if any test rule matches the current upload and returns
-// the overridden status code and body. Returns (0, "") if no rule matches (use default behavior).
-func (s *Server) matchUploadRule(clientPath string) (int, string) {
+// matchUploadRule checks if any test rule matches the current upload.
+// Returns the matching rule, or nil if no rule matches (use default behavior).
+func (s *Server) matchUploadRule(clientPath string) *UploadRule {
 	s.testMu.Lock()
 	s.uploadCount++
 	count := s.uploadCount
@@ -710,7 +717,7 @@ func (s *Server) matchUploadRule(clientPath string) (int, string) {
 	s.testMu.Unlock()
 
 	if len(rules) == 0 {
-		return 0, ""
+		return nil
 	}
 
 	filename := filepath.Base(clientPath)
@@ -723,21 +730,18 @@ func (s *Server) matchUploadRule(clientPath string) (int, string) {
 			continue
 		}
 		if rule.MatchFilename != "" && rule.MatchFilename == filename {
-			return rule.Status, rule.Body
+			return rule
 		}
 		if len(rule.MatchCount) > 0 {
 			for _, n := range rule.MatchCount {
 				if n == count {
-					return rule.Status, rule.Body
+					return rule
 				}
 			}
 		}
 	}
 
-	if defaultRule != nil {
-		return defaultRule.Status, defaultRule.Body
-	}
-	return 0, ""
+	return defaultRule
 }
 
 // ── Core scan logic ───────────────────────────────────────────────────────────
@@ -1042,9 +1046,13 @@ func firstBytesRepr(data []byte) string {
 	return fmt.Sprintf("%x / %s", chunk, firstBytesASCII(data))
 }
 
-func (s *Server) respond503(w http.ResponseWriter) {
+func (s *Server) respond503(w http.ResponseWriter, extraHeaders map[string]string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Retry-After", strconv.Itoa(s.cfg.RetryAfter))
+	// Rule-specific headers override defaults (e.g., custom Retry-After value)
+	for k, v := range extraHeaders {
+		w.Header().Set(k, v)
+	}
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": "server overloaded"})
 }
